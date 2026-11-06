@@ -4144,11 +4144,92 @@ function splitTextCommands(input) {
     return { parts: parts };
 }
 
+// VERB SYNONYMS (2026-11-05). One dictionary of interchangeable wording for the
+// core verbs, shared by typed text, speech and the AI plan repair. It is only
+// consulted after every specific parser declines, so it can never override a
+// registered command. Keys are command ids; values are the phrases that mean it.
+const TEXT_VERB_SYNONYMS = {
+    examine: ["look at", "look closely at", "look over", "look upon", "look into", "observe", "view", "check", "check out", "scrutinize", "eyeball", "gaze at", "stare at", "peer at", "study closely"],
+    look: ["survey", "scan", "glance around", "look about", "look round"],
+    take: ["snatch", "collect", "fetch", "retrieve", "pocket", "acquire", "gather up", "scoop up", "grab hold of"],
+    drop: ["discard", "toss", "throw away", "ditch", "leave behind", "abandon item", "set down", "lay down"],
+    talk: ["chat", "chat with", "speak", "speak with", "converse", "converse with", "hail", "approach", "have a word with", "greet"],
+    attack: ["fight", "kill", "slay", "assault", "stab", "slash", "battle", "smite"],
+    move: ["travel", "run", "dash", "proceed", "stroll", "wander", "hurry", "stride", "walk to", "go to", "head to"],
+    equip: ["don", "strap on", "arm myself with", "brandish"],
+    unequip: ["doff", "strip off", "take off", "unwield", "sheathe", "stow away"],
+    eat: ["devour", "munch", "nibble", "swallow", "gobble", "snack on", "dine on"],
+    drink: ["gulp", "imbibe", "swig", "guzzle", "slurp", "down"],
+    search: ["ransack", "scour", "frisk", "comb through", "rifle through", "rummage through", "forage through"],
+    open: ["unlatch", "unseal", "pull open", "swing open"],
+    rest: ["relax", "recuperate", "catch my breath", "take a break", "take a rest"],
+    sleep: ["nap", "doze", "slumber", "turn in", "lie down to sleep"],
+    wake: ["rouse", "awaken", "shake awake", "nudge awake"],
+    inventory: ["what am i carrying", "what do i have", "what do i carry", "my belongings", "my pack", "my bag", "my things", "check my pack", "check my bag", "check my inventory"],
+    leave: ["farewell", "see you", "so long", "excuse myself", "take my leave", "depart"],
+    exits: ["where can i go", "which way", "what exits are there", "what ways are there"]
+};
+const TEXT_VERB_SYNONYM_LIST = (function () {
+    const list = [];
+    Object.keys(TEXT_VERB_SYNONYMS).forEach(function (canonical) {
+        TEXT_VERB_SYNONYMS[canonical].forEach(function (phrase) {
+            list.push({ phrase: phrase, canonical: canonical, re: new RegExp("^" + phrase.replace(/ /g, "\\s+") + "(?:\\s+([\\s\\S]+))?$", "i") });
+        });
+    });
+    // Longest phrase first so "look closely at" beats "look".
+    return list.sort(function (a, b) { return b.phrase.length - a.phrase.length; });
+})();
+const TEXT_SYNONYM_ROOM_REST = /^(?:the\s+)?(?:room|area|place|surroundings|scene|around(?:\s+(?:me|here|the room))?|about|here|round)$/i;
+// Returns the same request in canonical wording, or null when no synonym leads it.
+function textCommandSynonymRewrite(raw) {
+    const text = String(raw || "").trim().replace(/[.!?]+$/, "").trim();
+    for (let i = 0; i < TEXT_VERB_SYNONYM_LIST.length; i++) {
+        const entry = TEXT_VERB_SYNONYM_LIST[i], match = entry.re.exec(text);
+        if (!match) continue;
+        const rest = String(match[1] || "").trim().replace(/^(?:the|a|an)\s+(?=\S)/i, "");
+        const canonical = entry.canonical;
+        // Whole-sentence phrases ("what do i have") stand alone.
+        if (/^(?:inventory|leave|exits)$/.test(canonical)) return rest ? null : canonical;
+        // Movement words also open ordinary sentences ("run my hand along the wall"),
+        // so they only count as travel when a direction follows.
+        if (canonical === "move") {
+            const heading = textCommandNormalize(rest).replace(/^(?:to(?:wards?)?\s+)?(?:the\s+)?/, "").replace(/wards?$/, "");
+            return textCommandDirection(heading) ? "go " + heading : null;
+        }
+        if (canonical === "examine" || canonical === "look") {
+            if (!rest || TEXT_SYNONYM_ROOM_REST.test(rest)) return "look";
+            // "check my pack", "view equipment", "look at the exits" are listings, not inspections.
+            const listing = /^(?:my\s+)?(?:inventory|pack|bag|backpack|belongings|things|items)$/i.test(rest) ? "inventory"
+                : /^(?:my\s+)?(?:equipment|gear)$/i.test(rest) ? "equipment"
+                : /^(?:my\s+)?(?:stats|status|health)$/i.test(rest) ? rest.replace(/^my\s+/i, "").toLowerCase()
+                : /^exits?$/i.test(rest) ? "exits"
+                : /^(?:people|npcs|creatures|everyone)$/i.test(rest) ? "who is here" : "";
+            return listing || "examine " + rest;
+        }
+        return rest ? canonical + " " + rest : canonical;
+    }
+    return null;
+}
+// Polite or first-person lead-ins ("please", "can you", "I want to", "let me")
+// carry no meaning for the engine; the verb that follows does.
+const TEXT_LEAD_IN = /^(?:please\s+|(?:can|could|would|will)\s+you\s+(?:please\s+)?|(?:can|could|may)\s+i\s+(?:please\s+)?|i\s*(?:would|'d)?\s*(?:really\s+)?(?:like|want|wish|need)\s+to\s+|i(?:'|\s+a)m\s+going\s+to\s+|i\s+(?:will|'ll)\s+(?:now\s+)?|i'll\s+|let\s+me\s+|let's\s+|lets\s+|i\s+(?:try|attempt)\s+to\s+|i\s+)/i;
+const TEXT_LEAD_IN_REJECT = /^(?:help|show|say|choose|stop|continue|replay|cancel|back|leave|options|adjudicate|act)$/;
+function textCommandStripLeadIn(raw) {
+    const text = String(raw || "").trim().replace(/[’]/g, "'").replace(/\s+please[.!?]*$/i, "");
+    const match = TEXT_LEAD_IN.exec(text);
+    if (!match) return null;
+    const rest = text.slice(match[0].length).trim();
+    return rest ? rest : null;
+}
+
 function parseTextCommand(input) {
     const original = String(input || "").trim();
     const raw = original.replace(/[.!?]+$/, "").trim();
     const key = textCommandNormalize(raw);
     if (/^(?:sleep until rested|go to sleep)$/.test(key)) return { verb: "sleep", args: {} };
+    // "please look at the door", "can you take the sword", "I want to go north".
+    const leadRest = textCommandStripLeadIn(raw);
+    if (leadRest) { const inner = parseTextCommand(leadRest); if (inner && !TEXT_LEAD_IN_REJECT.test(inner.verb)) return inner; }
     const phrase = parseTextPhraseCommand(raw); if (phrase) return phrase;
     const rulings = parseTextRulingsCommand(raw); if (rulings) return rulings;
     let match = /^(?:how(?:\s+(?:do|can)\s+i)?|help)(?:\s+(?:to\s+)?(.+))?$/i.exec(raw);
@@ -4259,7 +4340,15 @@ function parseTextCommand(input) {
     const direction = textCommandDirection(raw);
     if (direction) return { verb: "move", args: { direction: direction } };
     const entry = TEXT_COMMANDS.find(function (def) { return key === (def.primary || def.id) || def.aliases.indexOf(key) >= 0; });
-    return entry ? { verb: entry.id, args: {} } : parseTextAdjudicationFallback(raw);
+    if (entry) return { verb: entry.id, args: {} };
+    // Interchangeable wording ("check", "observe", "snatch", "chat with"): restate
+    // it in the canonical verb and parse again through the same shared handlers.
+    const canonical = textCommandSynonymRewrite(raw);
+    if (canonical && textCommandNormalize(canonical) !== key) {
+        const synonym = parseTextCommand(canonical);
+        if (synonym && synonym.verb !== "adjudicate") return synonym;
+    }
+    return parseTextAdjudicationFallback(raw);
 }
 
 function parseTextCommandBatch(input) {
@@ -4315,7 +4404,15 @@ function textAIPlanParse(raw) {
 // Repairs near-misses before validation: prompt shorthand keys (t -> target)
 // and common verb synonyms (speak -> talk). Only registered verbs and fields
 // can result; validateTextAIPlan still checks everything.
-const TEXT_AI_VERB_SYNONYMS = { speak: "talk", chat: "talk", converse: "talk", greet: "talk", go: "move", walk: "move", head: "move", inspect: "examine", check: "examine", view: "examine", grab: "take", get: "take", hit: "attack", strike: "attack", fight: "attack", awaken: "wake", rouse: "wake" };
+// Built from the shared TEXT_VERB_SYNONYMS dictionary (single words only), plus
+// a few model habits that are not natural player wording.
+const TEXT_AI_VERB_SYNONYMS = (function () {
+    const map = { go: "move", walk: "move", head: "move", inspect: "examine", grab: "take", get: "take", hit: "attack", strike: "attack", look_at: "examine", pickup: "take", pick_up: "take", examine_npc: "examine", talk_to: "talk", speak_to: "talk" };
+    Object.keys(TEXT_VERB_SYNONYMS).forEach(function (canonical) {
+        TEXT_VERB_SYNONYMS[canonical].forEach(function (phrase) { if (!/\s/.test(phrase) && !Object.prototype.hasOwnProperty.call(map, phrase)) map[phrase] = canonical; });
+    });
+    return map;
+})();
 function textAIPlanNormalize(value) {
     if (!value || !Array.isArray(value.actions)) return value;
     const fields = Object.create(null);
@@ -6130,7 +6227,7 @@ function textLocalTargetMiss(actions) {
         }
         target = String(target || "").trim();
         if (!target) return false;
-        try { return resolveTextNPCTarget(target, textModeVisibleNPCs()).matches.length === 0; } catch (e) { return false; }
+        try { return resolveTextNPCTarget(target, textModeVisibleNPCs()).matches.length === 0 && !(action.verb === "examine" && textModeBodyMatches(action).length); } catch (e) { return false; }
     });
 }
 
@@ -6227,22 +6324,45 @@ function textModeWhoIsHereLine(candidates) {
     return list.length ? " Here: " + list.join(", ") + "." : " No one is here.";
 }
 
+function textModeVisibleBodies() {
+    const room = G.activeRoom;
+    return room && Array.isArray(room.items) ? room.items.filter(function (item) {
+        return item && item.objectType === "body" && !item.hidden && !item.isHidden && !item.concealed && item.visible !== false && isVisibleEntity(item);
+    }) : [];
+}
+
+// Bodies match by the same public words as people (species, gender, descriptor)
+// plus their state ("unconscious", "corpse", "body").
+function textModeBodyMatches(action) {
+    const args = action.args || {}, bodies = textModeVisibleBodies();
+    if (!bodies.length) return [];
+    if (action.targetRef) return bodies.filter(function (body) { return body === action.targetRef; });
+    const extraWords = function (body) { return [body.originalName, getEntityName(body), body.bodyState === "unconscious" ? "unconscious body" : "corpse body dead remains"].join(" "); };
+    try {
+        return args.scope === "npc" ? textNPCMatchesOrGuess(args.item, bodies, { lenient: true, extraWords: extraWords }) : resolveTextNPCTarget(args.item, bodies, extraWords).matches;
+    } catch (e) { return []; }
+}
+
 // Resolve public creature descriptions before falling through to item/fixture
 // inspection. Explicit item locations keep their existing selection rules.
 function textModeInspectNPC(action) {
     const args = action.args || {};
     if (action.itemRef || action.fixtureRef || args.scope && args.scope !== "npc") return null;
     if (!args.scope && /^(?:carried|inventory|equipped|worn|floor|ground)\b/i.test(args.item || "")) return null;
-    const matches = action.targetRef ? textModeVisibleNPCs().filter(function (npc) { return npc === action.targetRef; }) : args.scope === "npc" ? textNPCMatchesOrGuess(args.item, textModeVisibleNPCs(), { lenient: true }) : resolveTextNPCTarget(args.item).matches;
+    let matches = action.targetRef ? textModeVisibleNPCs().filter(function (npc) { return npc === action.targetRef; }) : args.scope === "npc" ? textNPCMatchesOrGuess(args.item, textModeVisibleNPCs(), { lenient: true }) : resolveTextNPCTarget(args.item).matches;
     if (!String(args.item || "").trim() && !action.targetRef) return null;
+    // Unconscious people and corpses are room bodies, not creatures. Looking at
+    // "lizardfolk" must find them when no standing creature fits.
+    if (!matches.length) matches = textModeBodyMatches(action);
     if (!matches.length) return args.scope === "npc" || action.targetRef ? textModeResult("blocked", "No visible NPC matches that description." + textModeWhoIsHereLine() + " Type who is here.") : null;
     if (!args.scope && !action.targetRef && (resolveTextInventoryItems(args.item, "examine").length || textLootMatch(args.item, textExplorationFixtures(), function (entry) { return entry.label; }).length)) {
         return textModeResult("blocked", "That description matches a creature and an item or fixture. Use examine npc <description>, examine fixture <name>, or examine carried/floor <item>.");
     }
     if (matches.length > 1) return textModeAsk(action, "target", matches, "Who do you want to look at?");
     const npc = matches[0], name = textModeNPCLabel(npc);
-    const description = [buildNPCLookDescription(npc) || "You see " + name + ".",
-        typeof getNPCPartyDescription === "function" ? getNPCPartyDescription(npc) : ""].filter(Boolean).join("\n\n");
+    const isBody = npc.objectType === "body";
+    const description = [(isBody && npc.bodyState === "corpse" ? npc.description : buildNPCLookDescription(npc)) || npc.description || "You see " + name + ".",
+        !isBody && typeof getNPCPartyDescription === "function" ? getNPCPartyDescription(npc) : ""].filter(Boolean).join("\n\n");
     setNarration(description);
     publishTextModeOutput("inspection", description, { npc: { name: name, description: description, appearance: typeof getPublicAppearanceFacts === "function" ? getPublicAppearanceFacts(npc) : null, travelParty: typeof getNPCPartyPublicInfo === "function" ? getNPCPartyPublicInfo(npc) : null } }, false);
     return { status: "completed" };
@@ -6718,7 +6838,15 @@ async function executeTextCommand(action) {
         if (reason) return textModeResult("blocked", reason);
     }
     if (def.trade) return executeTextTradeCommand(action);
-    if (action.verb === "examine" && args.scope) return args.scope === "stock" ? executeTextTradeInspect(action) : textModeResult("blocked", "Use examine <item>, or examine stock <item>.");
+    if (action.verb === "examine" && args.scope === "stock") return executeTextTradeInspect(action);
+    if (action.verb === "examine" && args.scope) {
+        // An interpreted plan may carry a location word as scope ("floor", "room",
+        // "body"). The item resolver reads a location only as a prefix, so restate it
+        // there and inspect normally instead of refusing a sensible request.
+        const place = textCommandNormalize(args.scope);
+        action.args = Object.assign({}, args, { item: (/^(?:carried|inventory|equipped|worn|floor|ground)$/.test(place) ? place + " " : "") + String(args.item || "").trim(), scope: "" });
+        delete action.args.scope;
+    }
     if (def.inventory) return executeTextInventoryCommand(action);
     if (def.combat) return executeTextCombatCommand(action);
     if (action.verb === "npcs") {
@@ -57002,6 +57130,9 @@ function isNsfwBodyEligible(item) {
 }
 
 function getBoneBodyName(npc, originalName, outcome) {
+    // Descriptive names arrive with their article ("a female Lizardfolk"); drop it so
+    // the body reads "unconscious female Lizardfolk", not "unconscious a female ...".
+    originalName = String(originalName || "").replace(/^(?:a|an|the)\s+/i, "");
     if (isSlimeEntity(npc)) return outcome === "corpse" ? `remains of ${originalName}` : `unconscious ${originalName}`;
     if (typeof getBodyKind === "function" && getBodyKind(npc) === "bone") {
         return outcome === "corpse" ? `remains of ${originalName}` : `collapsed ${originalName}`;
